@@ -1,0 +1,94 @@
+version: '3.8'
+
+services:
+  keycloak_db:
+    image: postgres:14
+    environment:
+      POSTGRES_DB: keycloak_db
+      POSTGRES_USER: keycloak_user
+      POSTGRES_PASSWORD: keycloak_password
+    volumes:
+      - ./postgres-keycloak-data:/var/lib/postgresql/data
+    ports:
+      - "5433:5432"
+  keycloak:
+    image: quay.io/keycloak/keycloak:21.1
+    environment:
+      KEYCLOAK_ADMIN: admin
+      KEYCLOAK_ADMIN_PASSWORD: admin
+      KC_DB: postgres
+      KC_DB_URL: jdbc:postgresql://keycloak_db:5432/keycloak_db
+      KC_DB_USERNAME: keycloak_user
+      KC_DB_PASSWORD: keycloak_password
+    command: 
+      - start-dev
+      - --import-realm
+    volumes:
+      - ./keycloak/realm-export.json:/opt/keycloak/data/import/realm-export.json
+    ports:
+      - "8080:8080"
+    depends_on:
+      - keycloak_db
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    ports:
+      - "3000:3000"
+    environment:
+      REACT_APP_API_URL: http://localhost:8000
+      REACT_APP_KEYCLOAK_URL: http://localhost:8080
+      REACT_APP_KEYCLOAK_REALM: reports-realm
+      REACT_APP_KEYCLOAK_CLIENT_ID: reports-frontend
+  openldap:
+    image: osixia/openldap:1.5.0
+    container_name: openldap
+    command: --copy-service
+    volumes:
+      - ./ldap/config.ldif:/container/service/slapd/assets/config/bootstrap/ldif/50-bootstrap.ldif
+    environment:
+      - LDAP_ORGANISATION=example-com
+      - LDAP_DOMAIN=example.com
+      - LDAP_ADMIN_PASSWORD=admin
+    ports:
+      - "389:389"
+      - "636:636"
+  crm_db: 
+    image: postgres:14
+    environment:
+      POSTGRES_DB: crm_db
+      POSTGRES_USER: crm_user
+      POSTGRES_PASSWORD: crm_password
+    volumes:
+        - ./crm-db:/docker-entrypoint-initdb.d
+        - ./postgres-crm-data:/var/lib/postgresql/data
+    ports:
+      - "5444:5432"
+  olap_db:
+    image: clickhouse/clickhouse-server:latest
+    ports:
+      - "8123:8123"
+      - "9431:9000"
+    volumes:
+      - ./clickhouse-data:/var/lib/clickhouse
+      - ./olap-db:/docker-entrypoint-initdb.d
+      - ./olap-db:/var/lib/clickhouse/user_files
+      - ./olap-db/users.xml:/etc/clickhouse-server/users.d/users.xml
+    healthcheck:
+      test: ["CMD-SHELL", "clickhouse-client --query 'SELECT 1'"]
+      interval: 1s
+      timeout: 3s
+      retries: 30
+  minio:
+    image: minio/minio
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio_storage:/data
+    environment:
+      MINIO_ROOT_USER: minio_user
+      MINIO_ROOT_PASSWORD: minio_password
+    command: server --console-address ":9001" /data
+volumes:
+  minio_storage: {}
