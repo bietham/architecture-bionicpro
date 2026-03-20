@@ -1,6 +1,8 @@
 version: '3.8'
 
+
 services:
+  # ─── Keycloak ──────────────────────────────────────────────────────────────
   keycloak_db:
     image: postgres:14
     environment:
@@ -11,6 +13,12 @@ services:
       - ./postgres-keycloak-data:/var/lib/postgresql/data
     ports:
       - "5433:5432"
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "keycloak_user", "-d", "keycloak_db"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
   keycloak:
     image: quay.io/keycloak/keycloak:21.1
     environment:
@@ -20,7 +28,7 @@ services:
       KC_DB_URL: jdbc:postgresql://keycloak_db:5432/keycloak_db
       KC_DB_USERNAME: keycloak_user
       KC_DB_PASSWORD: keycloak_password
-    command: 
+    command:
       - start-dev
       - --import-realm
     volumes:
@@ -28,7 +36,10 @@ services:
     ports:
       - "8080:8080"
     depends_on:
-      - keycloak_db
+      keycloak_db:
+        condition: service_healthy
+
+  # ─── Frontend ──────────────────────────────────────────────────────────────
   frontend:
     build:
       context: ./frontend
@@ -40,6 +51,28 @@ services:
       REACT_APP_KEYCLOAK_URL: http://localhost:8080
       REACT_APP_KEYCLOAK_REALM: reports-realm
       REACT_APP_KEYCLOAK_CLIENT_ID: reports-frontend
+
+  # ─── Backend API (Reports Service) ─────────────────────────────────────────
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    environment:
+      KEYCLOAK_URL: http://keycloak:8080
+      KEYCLOAK_ISSUER: http://localhost:8080/realms/reports-realm
+      KEYCLOAK_REALM: reports-realm
+      KEYCLOAK_CLIENT_ID: reports-api
+      CRM_DSN: "host=crm_db port=5432 dbname=crm_db user=crm_user password=crm_password"
+      OLAP_HOST: olap_db
+      OLAP_PORT: "8123"
+    depends_on:
+      - keycloak
+      - crm_db
+      - olap_db
+
+  # ─── LDAP ──────────────────────────────────────────────────────────────────
   openldap:
     image: osixia/openldap:1.5.0
     container_name: openldap
@@ -53,17 +86,26 @@ services:
     ports:
       - "389:389"
       - "636:636"
-  crm_db: 
+
+  # ─── CRM Database ──────────────────────────────────────────────────────────
+  crm_db:
     image: postgres:14
     environment:
       POSTGRES_DB: crm_db
       POSTGRES_USER: crm_user
       POSTGRES_PASSWORD: crm_password
     volumes:
-        - ./crm-db:/docker-entrypoint-initdb.d
-        - ./postgres-crm-data:/var/lib/postgresql/data
+      - ./crm-db:/docker-entrypoint-initdb.d
+      - ./postgres-crm-data:/var/lib/postgresql/data
     ports:
       - "5444:5432"
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "crm_user", "-d", "crm_db"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # ─── OLAP Database (ClickHouse) ────────────────────────────────────────────
   olap_db:
     image: clickhouse/clickhouse-server:latest
     ports:
@@ -79,6 +121,8 @@ services:
       interval: 1s
       timeout: 3s
       retries: 30
+
+  # ─── MinIO (object storage) ────────────────────────────────────────────────
   minio:
     image: minio/minio
     ports:
@@ -90,5 +134,105 @@ services:
       MINIO_ROOT_USER: minio_user
       MINIO_ROOT_PASSWORD: minio_password
     command: server --console-address ":9001" /data
+
+  # ─── Airflow metadata DB ───────────────────────────────────────────────────
+  airflow_db:
+    image: postgres:14
+    environment:
+      POSTGRES_DB: airflow
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+    volumes:
+      - ./postgres-airflow-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "airflow"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # ─── Airflow Init ──────────────────────────────────────────────────────────
+  # entrypoint переопределён на /bin/bash, поэтому _PIP_ADDITIONAL_REQUIREMENTS
+  # из стандартного entrypoint Airflow не отработает — ставим пакеты явно.
+  airflow_init:
+    image: apache/airflow:2.9.1-python3.11
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        pip install --quiet psycopg2-binary clickhouse-connect &&
+        airflow db migrate &&
+        airflow users create \
+          --username admin \
+          --password admin \
+          --firstname Admin \
+          --lastname User \
+          --role Admin \
+          --email admin@bionic.pro || true
+    environment:
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@airflow_db/airflow
+      AIRFLOW__CORE__FERNET_KEY: ''
+      AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
+    volumes:
+      - ./dags:/opt/airflow/dags
+      - airflow_logs:/opt/airflow/logs
+    depends_on:
+      airflow_db:
+        condition: service_healthy
+    restart: "no"
+
+  # ─── Airflow Scheduler ─────────────────────────────────────────────────────
+  airflow_scheduler:
+    image: apache/airflow:2.9.1-python3.11
+    command: scheduler
+    environment:
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@airflow_db/airflow
+      AIRFLOW__CORE__FERNET_KEY: ''
+      AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'false'
+      AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
+      AIRFLOW__SCHEDULER__ENABLE_HEALTH_CHECK: 'true'
+      _PIP_ADDITIONAL_REQUIREMENTS: "psycopg2-binary clickhouse-connect"
+    volumes:
+      - ./dags:/opt/airflow/dags
+      - airflow_logs:/opt/airflow/logs
+    depends_on:
+      airflow_db:
+        condition: service_healthy
+      crm_db:
+        condition: service_healthy
+      olap_db:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "airflow jobs check --job-type SchedulerJob --hostname $(hostname)"]
+      interval: 30s
+      retries: 5
+
+  # ─── Airflow Webserver ─────────────────────────────────────────────────────
+  airflow_webserver:
+    image: apache/airflow:2.9.1-python3.11
+    command: webserver
+    environment:
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@airflow_db/airflow
+      AIRFLOW__CORE__FERNET_KEY: ''
+      AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
+      _PIP_ADDITIONAL_REQUIREMENTS: "psycopg2-binary clickhouse-connect"
+    volumes:
+      - ./dags:/opt/airflow/dags
+      - airflow_logs:/opt/airflow/logs
+    ports:
+      - "8888:8080"
+    depends_on:
+      airflow_db:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/health"]
+      interval: 30s
+      retries: 5
+
 volumes:
   minio_storage: {}
+  airflow_logs: {}
