@@ -1,6 +1,3 @@
-version: '3.8'
-
-
 services:
   # ─── Keycloak ──────────────────────────────────────────────────────────────
   keycloak_db:
@@ -46,11 +43,9 @@ services:
       dockerfile: Dockerfile
     ports:
       - "3000:3000"
-    environment:
-      REACT_APP_API_URL: http://localhost:8000
-      REACT_APP_KEYCLOAK_URL: http://localhost:8080
-      REACT_APP_KEYCLOAK_REALM: reports-realm
-      REACT_APP_KEYCLOAK_CLIENT_ID: reports-frontend
+    # Примечание: REACT_APP_* переменные вшиваются в бандл на этапе
+    # npm run build (из frontend/.env). Прокидывание через environment
+    # бесполезно — nginx их не использует.
 
   # ─── Backend API (Reports Service) ─────────────────────────────────────────
   backend:
@@ -68,9 +63,12 @@ services:
       OLAP_HOST: olap_db
       OLAP_PORT: "8123"
     depends_on:
-      - keycloak
-      - crm_db
-      - olap_db
+      keycloak:
+        condition: service_started
+      crm_db:
+        condition: service_healthy
+      olap_db:
+        condition: service_healthy
 
   # ─── LDAP ──────────────────────────────────────────────────────────────────
   openldap:
@@ -107,7 +105,7 @@ services:
 
   # ─── OLAP Database (ClickHouse) ────────────────────────────────────────────
   olap_db:
-    image: clickhouse/clickhouse-server:latest
+    image: clickhouse/clickhouse-server:24.3
     ports:
       - "8123:8123"
       - "9431:9000"
@@ -197,6 +195,8 @@ services:
       - ./dags:/opt/airflow/dags
       - airflow_logs:/opt/airflow/logs
     depends_on:
+      airflow_init:
+        condition: service_completed_successfully
       airflow_db:
         condition: service_healthy
       crm_db:
@@ -225,6 +225,8 @@ services:
     ports:
       - "8888:8080"
     depends_on:
+      airflow_init:
+        condition: service_completed_successfully
       airflow_db:
         condition: service_healthy
     restart: unless-stopped
